@@ -51,8 +51,19 @@ func (bf *BruteForceProtection) RecordFailure(key string) {
 
 	now := time.Now()
 	rec, exists := bf.attempts[key]
-	if !exists || now.Sub(rec.firstFailure) > bf.window {
+	if !exists {
 		bf.attempts[key] = &attemptRecord{failures: 1, firstFailure: now}
+		return
+	}
+	if now.Sub(rec.firstFailure) > bf.window {
+		// A new window starts the failure count again, but not the
+		// lockout count: that count is what doubles each further
+		// lockout. Replacing the record here dropped it, and a caller
+		// who comes back when a lockout longer than the window ends
+		// always lands here. With the defaults the lockouts went 30s,
+		// 1m, 2m, 4m, 8m and then 30s again, never reaching the cap.
+		rec.failures = 1
+		rec.firstFailure = now
 		return
 	}
 
@@ -101,15 +112,28 @@ func (bf *BruteForceProtection) IsBlocked(key string) (bool, time.Duration) {
 func (bf *BruteForceProtection) cleanup() {
 	for {
 		time.Sleep(5 * time.Minute)
-		bf.mu.Lock()
-		now := time.Now()
-		for key, rec := range bf.attempts {
-			// Remove records that are expired and not locked
-			if now.Sub(rec.firstFailure) > bf.window*4 && !rec.lockedUntil.After(now) {
-				delete(bf.attempts, key)
-			}
+		bf.sweep(time.Now())
+	}
+}
+
+// sweep forgets keys that have gone quiet. A key that was locked out is
+// kept until it has been quiet for as long as the longest lockout. The
+// sweep used to drop it four windows after its last lockout began,
+// which a 30 minute lockout outlasts: a caller who waited a few minutes
+// more after it started again from the shortest lockout.
+func (bf *BruteForceProtection) sweep(now time.Time) {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+	for key, rec := range bf.attempts {
+		if rec.lockedUntil.After(now) {
+			continue
 		}
-		bf.mu.Unlock()
+		if rec.lockoutCount > 0 && now.Sub(rec.lockedUntil) <= bf.maxLockout {
+			continue
+		}
+		if now.Sub(rec.firstFailure) > bf.window*4 {
+			delete(bf.attempts, key)
+		}
 	}
 }
 
