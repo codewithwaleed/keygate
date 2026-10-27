@@ -80,8 +80,65 @@ func TestSweepKeepsLockedOutKeys(t *testing.T) {
 		t.Fatal("kept a key that was never locked out, 21 minutes after its only failure")
 	}
 
+	bf.sweep(now.Add(24 * time.Minute))
+	if !remembered(bf, "locked") {
+		t.Fatal("forgot a key 25 minutes after its lockout ended, while its count still applies")
+	}
+
 	bf.sweep(now.Add(30 * time.Minute))
 	if remembered(bf, "locked") {
 		t.Fatal("still remembered a key that has been quiet for longer than the longest lockout")
+	}
+}
+
+// The lockout count lasts as long as the longest lockout after the last
+// one ended, then starts again: a caller back within that time picks up
+// where it left off, one back later starts from the shortest lockout.
+func TestLockoutCountExpires(t *testing.T) {
+	for _, tc := range []struct {
+		quiet time.Duration
+		want  time.Duration
+	}{
+		{29 * time.Minute, time.Minute},
+		{31 * time.Minute, 30 * time.Second},
+	} {
+		bf := newDefaultBruteForce()
+		key := FailureKeyIP("203.0.113.9")
+		for range 5 {
+			bf.RecordFailure(key)
+		}
+		bf.mu.Lock()
+		rec := bf.attempts[key]
+		shift := time.Until(rec.lockedUntil) + tc.quiet
+		rec.firstFailure = rec.firstFailure.Add(-shift)
+		rec.lockedUntil = rec.lockedUntil.Add(-shift)
+		bf.mu.Unlock()
+
+		for range 5 {
+			bf.RecordFailure(key)
+		}
+		if _, left := bf.IsBlocked(key); left.Round(time.Second) != tc.want {
+			t.Errorf("back %v after the first lockout ended: next lockout %v, want %v", tc.quiet, left.Round(time.Second), tc.want)
+		}
+	}
+}
+
+// Failures of requests already past the guard when a lockout begins do
+// not count: they would start the next, doubled lockout at once.
+func TestFailuresDuringALockoutDoNotCount(t *testing.T) {
+	bf := newDefaultBruteForce()
+	key := FailureKeyIP("203.0.113.11")
+	for range 10 {
+		bf.RecordFailure(key)
+	}
+	if _, left := bf.IsBlocked(key); left.Round(time.Second) != 30*time.Second {
+		t.Fatalf("a burst of 10 failures: lockout %v, want 30s", left.Round(time.Second))
+	}
+	endLockout(bf, key)
+	for range 5 {
+		bf.RecordFailure(key)
+	}
+	if _, left := bf.IsBlocked(key); left.Round(time.Second) != time.Minute {
+		t.Fatalf("next lockout %v, want 1m", left.Round(time.Second))
 	}
 }

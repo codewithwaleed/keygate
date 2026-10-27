@@ -55,6 +55,12 @@ func (bf *BruteForceProtection) RecordFailure(key string) {
 		bf.attempts[key] = &attemptRecord{failures: 1, firstFailure: now}
 		return
 	}
+	if rec.lockedUntil.After(now) {
+		// A request that passed the guard just before this lockout began
+		// is paid for by it. Counting it would start the next, doubled
+		// lockout at once, and the count now outlives the window.
+		return
+	}
 	if now.Sub(rec.firstFailure) > bf.window {
 		// A new window starts the failure count again, but not the
 		// lockout count: that count is what doubles each further
@@ -64,6 +70,13 @@ func (bf *BruteForceProtection) RecordFailure(key string) {
 		// 1m, 2m, 4m, 8m and then 30s again, never reaching the cap.
 		rec.failures = 1
 		rec.firstFailure = now
+		// The count lasts as long as the longest lockout after the last
+		// one ended. An address many people share (an office, a school)
+		// that was locked out once must not have a stray typo, an hour
+		// later, start it at the cap.
+		if now.Sub(rec.lockedUntil) > bf.maxLockout {
+			rec.lockoutCount = 0
+		}
 		return
 	}
 
